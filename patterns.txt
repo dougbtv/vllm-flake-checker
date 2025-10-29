@@ -1,0 +1,12 @@
+# vllm-flake-checker patterns file
+# One pattern per line. Lines starting with # are ignored.
+# Use --regex flag to enable regex matching, otherwise patterns are treated as literal strings.
+
+# Test consistency failure
+FAILED .*::test_multi_shared_storage_connector_consistency\b
+
+# Token mismatch errors
+At index 2 diff: 'get_num_new_matched_tokens 96' != 'build_connector_meta'
+get_num_new_matched_tokens 96
+
+# Add more patterns below as needed:
