@@ -59,7 +59,9 @@ class FlakeChecker:
                 # Retry on rate limit or server errors
                 if response.status_code == 429 or response.status_code >= 500:
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        # Longer wait for rate limits
+                        wait_time = (2 ** attempt) * (5 if response.status_code == 429 else 1)
+                        print(f"Rate limit hit, waiting {wait_time}s...", file=sys.stderr)
                         time.sleep(wait_time)
                         continue
 
@@ -79,8 +81,8 @@ class FlakeChecker:
         raise Exception(f"Failed after {max_retries} attempts")
 
     def get_builds(self, page: int = 1, per_page: int = 50) -> Tuple[List[Dict], Optional[str]]:
-        """Fetch builds from Buildkite API."""
-        params = {"page": page, "per_page": per_page}
+        """Fetch builds from Buildkite API (includes jobs in response)."""
+        params = {"page": page, "per_page": per_page, "include_retried_jobs": "true"}
         url = f"{self.api_base}/organizations/{self.org}/pipelines/{self.pipeline}/builds?{urlencode(params)}"
 
         response = self._make_request(url)
@@ -88,19 +90,14 @@ class FlakeChecker:
 
         return response.json(), next_url
 
-    def get_jobs(self, build_number: int) -> List[Dict]:
-        """Fetch jobs for a specific build."""
-        url = f"{self.api_base}/organizations/{self.org}/pipelines/{self.pipeline}/builds/{build_number}/jobs"
-
-        response = self._make_request(url)
-        return response.json()
-
     def get_job_log(self, build_number: int, job_id: str) -> Optional[str]:
         """Fetch log for a specific job. Returns None if log not available."""
         url = f"{self.api_base}/organizations/{self.org}/pipelines/{self.pipeline}/builds/{build_number}/jobs/{job_id}/log?format=txt"
 
         try:
             response = self._make_request(url, timeout=60)
+            # Add small delay to avoid rate limiting
+            time.sleep(0.3)
             return response.text
         except requests.HTTPError as e:
             if e.response.status_code == 404:
@@ -149,6 +146,8 @@ class FlakeChecker:
         fetched = 0
 
         try:
+            print(f"Scanning up to {self.max_builds} builds...", file=sys.stderr)
+
             while fetched < self.max_builds:
                 builds, next_url = self.get_builds(page=page, per_page=50)
 
@@ -172,11 +171,12 @@ class FlakeChecker:
                     state = build.get("state", "unknown")
                     created_at = build.get("created_at", "")
 
-                    # Get jobs for this build
-                    try:
-                        jobs = self.get_jobs(build_number)
-                    except Exception as e:
-                        print(f"Warning: Failed to fetch jobs for build {build_number}: {e}", file=sys.stderr)
+                    print(f"Build #{build_number} [{branch}] - {state}", file=sys.stderr)
+
+                    # Get jobs from build object (already included in API response)
+                    jobs = build.get("jobs", [])
+
+                    if not jobs:
                         continue
 
                     # Filter jobs by step substring
@@ -188,12 +188,15 @@ class FlakeChecker:
 
                         self.jobs_scanned += 1
                         job_id = job["id"]
+                        job_state = job.get("state", "unknown")
+
+                        print(f"  Checking: {label} ({job_state})", file=sys.stderr)
 
                         # Get job log
                         try:
                             log = self.get_job_log(build_number, job_id)
                         except Exception as e:
-                            print(f"Warning: Failed to fetch log for job {job_id}: {e}", file=sys.stderr)
+                            print(f"  Warning: Failed to fetch log: {e}", file=sys.stderr)
                             continue
 
                         if not log:
@@ -206,6 +209,9 @@ class FlakeChecker:
                         del log
 
                         # Record matches
+                        if pattern_matches:
+                            print(f"  ✓ MATCH FOUND in {label}!", file=sys.stderr)
+
                         for pattern, snippet in pattern_matches:
                             self.matches.append({
                                 "build_number": build_number,
